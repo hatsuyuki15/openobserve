@@ -51,17 +51,15 @@ use crate::{
 #[post("/{org_id}/_bulk")]
 pub async fn bulk(
     thread_id: web::Data<usize>,
-    org_id: web::Path<String>,
     body: web::Bytes,
     in_req: HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    let org_id = org_id.into_inner();
     let user_email = in_req.headers().get("user_id").unwrap().to_str().unwrap();
     Ok(
-        match logs::bulk::ingest(**thread_id, &org_id, body, user_email).await {
+        match logs::bulk::ingest(**thread_id, body, user_email).await {
             Ok(v) => MetaHttpResponse::json(v),
             Err(e) => {
-                log::error!("Error processing request {org_id}/_bulk: {:?}", e);
+                log::error!("Error processing request /_bulk: {:?}", e);
                 HttpResponse::BadRequest().json(MetaHttpResponse::error(
                     http::StatusCode::BAD_REQUEST.into(),
                     e.to_string(),

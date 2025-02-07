@@ -37,7 +37,6 @@ use crate::{
     common::meta::ingestion::{BulkResponse, BulkResponseError, BulkResponseItem, IngestionStatus},
     service::{
         format_stream_name,
-        ingestion::check_ingestion_allowed,
         pipeline::batch_execution::{ExecutablePipeline, ExecutablePipelineBulkInputs},
         schema::get_upto_discard_error,
     },
@@ -50,15 +49,11 @@ pub const PIPELINE_EXEC_FAILED: &str = "pipeline_execution_failed";
 
 pub async fn ingest(
     thread_id: usize,
-    org_id: &str,
     body: web::Bytes,
     user_email: &str,
 ) -> Result<BulkResponse, anyhow::Error> {
     let start = std::time::Instant::now();
     let started_at = Utc::now().timestamp_micros();
-
-    // check system resource
-    check_ingestion_allowed(org_id, None)?;
 
     // let mut errors = false;
     let mut bulk_res = BulkResponse {
@@ -73,19 +68,21 @@ pub async fn ingest(
 
     let log_ingestion_errors = ingestion_log_enabled().await;
     let mut action = String::from("");
+    let mut org_id = String::from("");
     let mut stream_name = String::from("");
+    let mut identifier = (String::from(""), String::from(""));
     let mut doc_id = None;
 
     let mut blocked_stream_warnings: HashMap<String, bool> = HashMap::new();
 
-    let mut stream_executable_pipelines: HashMap<String, Option<ExecutablePipeline>> =
+    let mut stream_executable_pipelines: HashMap<(String, String), Option<ExecutablePipeline>> =
         HashMap::new();
     let mut stream_pipeline_inputs: HashMap<String, ExecutablePipelineBulkInputs> = HashMap::new();
 
     let mut user_defined_schema_map: HashMap<String, HashSet<String>> = HashMap::new();
     let mut streams_need_original_set: HashSet<String> = HashSet::new();
 
-    let mut json_data_by_stream = HashMap::new();
+    let mut json_data_by_identifier = HashMap::new();
     let mut next_line_is_data = false;
     let reader = BufReader::new(body.as_ref());
     for line in reader.lines() {
@@ -102,7 +99,8 @@ pub async fn ingest(
             if ret.is_none() {
                 continue; // skip
             }
-            (action, stream_name, doc_id) = ret.unwrap();
+            (action, org_id, stream_name, doc_id) = ret.unwrap();
+            identifier = (org_id.clone(), stream_name.clone());
 
             if stream_name.is_empty() || stream_name == "_" || stream_name == "/" {
                 let err_msg = format!("Invalid stream name: {}", line);
@@ -151,9 +149,9 @@ pub async fn ingest(
             }];
 
             // Start retrieve associated pipeline and initialize ExecutablePipeline
-            if !stream_executable_pipelines.contains_key(&stream_name) {
+            if !stream_executable_pipelines.contains_key(&identifier) {
                 let exec_pl_option = crate::service::ingestion::get_stream_executable_pipeline(
-                    org_id,
+                    &org_id,
                     &stream_name,
                     &StreamType::Logs,
                 )
@@ -162,7 +160,7 @@ pub async fn ingest(
                     let pl_destinations = exec_pl.get_all_destination_streams();
                     streams.extend(pl_destinations);
                 }
-                stream_executable_pipelines.insert(stream_name.clone(), exec_pl_option);
+                stream_executable_pipelines.insert((org_id.clone(), stream_name.clone()), exec_pl_option);
             }
             // End pipeline params construction
 
@@ -182,7 +180,7 @@ pub async fn ingest(
             let original_data = if value.is_object() {
                 // 2. current stream does not have pipeline
                 if stream_executable_pipelines
-                    .get(&stream_name)
+                    .get(&identifier)
                     .unwrap()
                     .is_none()
                 {
@@ -201,7 +199,7 @@ pub async fn ingest(
             };
 
             if stream_executable_pipelines
-                .get(&stream_name)
+                .get(&identifier)
                 .unwrap()
                 .is_some()
             {
@@ -209,7 +207,7 @@ pub async fn ingest(
                     bulk_res.errors = true;
                     metrics::INGEST_ERRORS
                         .with_label_values(&[
-                            org_id,
+                            &org_id,
                             StreamType::Logs.as_str(),
                             &stream_name,
                             TS_PARSE_FAILED,
@@ -234,7 +232,7 @@ pub async fn ingest(
                             bulk_res.errors = true;
                             metrics::INGEST_ERRORS
                                 .with_label_values(&[
-                                    org_id,
+                                    &org_id,
                                     StreamType::Logs.as_str(),
                                     &stream_name,
                                     TS_PARSE_FAILED,
@@ -291,7 +289,7 @@ pub async fn ingest(
                         original_data.unwrap().into(),
                     );
                     let record_id = crate::service::ingestion::generate_record_id(
-                        org_id,
+                        &org_id,
                         &stream_name,
                         &StreamType::Logs,
                     );
@@ -309,7 +307,7 @@ pub async fn ingest(
                             bulk_res.errors = true;
                             metrics::INGEST_ERRORS
                                 .with_label_values(&[
-                                    org_id,
+                                    &org_id,
                                     StreamType::Logs.as_str(),
                                     &stream_name,
                                     TS_PARSE_FAILED,
@@ -337,7 +335,7 @@ pub async fn ingest(
                     let failure_reason = Some(get_upto_discard_error().to_string());
                     metrics::INGEST_ERRORS
                         .with_label_values(&[
-                            org_id,
+                            &org_id,
                             StreamType::Logs.as_str(),
                             &stream_name,
                             TS_PARSE_FAILED,
@@ -360,8 +358,8 @@ pub async fn ingest(
                     json::Value::Number(timestamp.into()),
                 );
 
-                let (ts_data, fn_num) = json_data_by_stream
-                    .entry(stream_name.clone())
+                let (ts_data, fn_num) = json_data_by_identifier
+                    .entry(identifier.clone())
                     .or_insert((Vec::new(), None));
                 ts_data.push((timestamp, local_val));
                 *fn_num = Some(0); // no pl -> no func
@@ -370,7 +368,7 @@ pub async fn ingest(
     }
 
     // batch process records through pipeline
-    for (stream_name, exec_pl_option) in stream_executable_pipelines {
+    for ((org_id, stream_name), exec_pl_option) in stream_executable_pipelines {
         if let Some(exec_pl) = exec_pl_option {
             let Some(pipeline_inputs) = stream_pipeline_inputs.remove(&stream_name) else {
                 log::error!(
@@ -380,7 +378,7 @@ pub async fn ingest(
                 continue;
             };
             let (records, doc_ids, originals) = pipeline_inputs.into_parts();
-            match exec_pl.process_batch(org_id, records).await {
+            match exec_pl.process_batch(&org_id, records).await {
                 Err(e) => {
                     log::error!(
                         "[Pipeline] for stream {}/{}: Batch execution error: {}.",
@@ -391,7 +389,7 @@ pub async fn ingest(
                     bulk_res.errors = true;
                     metrics::INGEST_ERRORS
                         .with_label_values(&[
-                            org_id,
+                            &org_id,
                             StreamType::Logs.as_str(),
                             &stream_name,
                             TRANSFORM_FAILED,
@@ -408,7 +406,7 @@ pub async fn ingest(
                     );
                     continue;
                 }
-                Ok(pl_results) => {
+                Ok( pl_results) => {
                     let function_no = exec_pl.num_of_func();
                     for (stream_params, stream_pl_results) in pl_results {
                         if stream_params.stream_type != StreamType::Logs {
@@ -446,7 +444,7 @@ pub async fn ingest(
                                     originals[idx].clone().unwrap().into(),
                                 );
                                 let record_id = crate::service::ingestion::generate_record_id(
-                                    org_id,
+                                    &org_id,
                                     &stream_params.stream_name,
                                     &StreamType::Logs,
                                 );
@@ -463,7 +461,7 @@ pub async fn ingest(
                                 bulk_res.errors = true;
                                 metrics::INGEST_ERRORS
                                     .with_label_values(&[
-                                        org_id,
+                                        &org_id,
                                         StreamType::Logs.as_str(),
                                         &stream_name,
                                         TS_PARSE_FAILED,
@@ -492,7 +490,7 @@ pub async fn ingest(
                                 let error = get_upto_discard_error().to_string();
                                 metrics::INGEST_ERRORS
                                     .with_label_values(&[
-                                        org_id,
+                                        &org_id,
                                         StreamType::Logs.as_str(),
                                         &stream_name,
                                         TS_PARSE_FAILED,
@@ -516,8 +514,8 @@ pub async fn ingest(
                                 json::Value::Number(timestamp.into()),
                             );
 
-                            let (ts_data, fn_num) = json_data_by_stream
-                                .entry(stream_params.stream_name.to_string())
+                            let (ts_data, fn_num) = json_data_by_identifier
+                                .entry((org_id.clone(), stream_params.stream_name.to_string()))
                                 .or_insert((Vec::new(), None));
                             ts_data.push((timestamp, local_val));
                             *fn_num = Some(function_no)
@@ -535,14 +533,13 @@ pub async fn ingest(
 
     let (metric_rpt_status_code, response_body) = {
         let mut status = IngestionStatus::Bulk(bulk_res);
-        let write_result = super::write_logs_by_stream(
+        let write_result = super::write_logs_by_stream_bulk(
             thread_id,
-            org_id,
             user_email,
             (started_at, &start),
             UsageType::Bulk,
             &mut status,
-            json_data_by_stream,
+            json_data_by_identifier,
         )
         .await;
         let IngestionStatus::Bulk(mut bulk_res) = status else {
@@ -565,7 +562,7 @@ pub async fn ingest(
         .with_label_values(&[
             "/api/org/ingest/logs/_bulk",
             metric_rpt_status_code,
-            org_id,
+            "all",
             "",
             StreamType::Logs.as_str(),
         ])
@@ -574,7 +571,7 @@ pub async fn ingest(
         .with_label_values(&[
             "/api/org/ingest/logs/_bulk",
             metric_rpt_status_code,
-            org_id,
+            "all",
             "",
             StreamType::Logs.as_str(),
         ])

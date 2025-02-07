@@ -291,7 +291,7 @@ pub async fn ingest(
                     ])
                     .inc();
             }
-            Ok(pl_results) => {
+            Ok( pl_results) => {
                 let function_no = exec_pl.num_of_func();
                 for (stream_params, stream_pl_results) in pl_results {
                     if stream_params.stream_type != StreamType::Logs {
@@ -320,7 +320,7 @@ pub async fn ingest(
                                 original_options[idx].clone().unwrap().into(),
                             );
                             let record_id = crate::service::ingestion::generate_record_id(
-                                org_id,
+                                &org_id,
                                 &stream_params.stream_name,
                                 &StreamType::Logs,
                             );
@@ -339,7 +339,7 @@ pub async fn ingest(
                             stream_status.status.error = err.to_string();
                             metrics::INGEST_ERRORS
                                 .with_label_values(&[
-                                    org_id,
+                                    &org_id,
                                     StreamType::Logs.as_str(),
                                     &stream_name,
                                     TS_PARSE_FAILED,

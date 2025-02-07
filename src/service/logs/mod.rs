@@ -66,12 +66,18 @@ static BULK_OPERATORS: [&str; 3] = ["create", "index", "update"];
 
 pub type O2IngestJsonData = (Vec<(i64, Map<String, Value>)>, Option<usize>);
 
-fn parse_bulk_index(v: &Value) -> Option<(String, String, Option<String>)> {
+fn parse_bulk_index(v: &Value) -> Option<(String, String, String, Option<String>)> {
     let local_val = v.as_object().unwrap();
     for action in BULK_OPERATORS {
         if let Some(val) = local_val.get(action) {
             let Some(local_val) = val.as_object() else {
                 log::warn!("Invalid bulk index action: {}", action);
+                continue;
+            };
+            let Some(organization) = local_val
+                .get("_organization")
+                .and_then(|v| v.as_str().map(|v| v.to_string()))
+            else {
                 continue;
             };
             let Some(index) = local_val
@@ -83,7 +89,7 @@ fn parse_bulk_index(v: &Value) -> Option<(String, String, Option<String>)> {
             let doc_id = local_val
                 .get("_id")
                 .and_then(|v| v.as_str().map(|v| v.to_string()));
-            return Some((action.to_string(), index, doc_id));
+            return Some((action.to_string(), organization, index, doc_id));
         };
     }
     None
@@ -195,6 +201,67 @@ fn set_parsing_error(parse_error: &mut String, field: &Field) {
     ));
 }
 
+async fn write_logs_by_stream_bulk(
+    thread_id: usize,
+    user_email: &str,
+    time_stats: (i64, &Instant), // started_at
+    usage_type: UsageType,
+    status: &mut IngestionStatus,
+    json_data_by_stream: HashMap<(String, String), (Vec<(i64, Map<String, Value>)>, Option<usize>)>,
+) -> Result<()> {
+    for ((org_id, stream_name), (json_data, fn_num)) in json_data_by_stream {
+        // check if we are allowed to ingest
+        if db::compact::retention::is_deleting_stream(&org_id, StreamType::Logs, &stream_name, None)
+        {
+            log::warn!("stream [{stream_name}] is being deleted");
+            continue; // skip
+        }
+
+        // write json data by stream
+        let mut req_stats = write_logs(thread_id, &org_id, &stream_name, status, json_data).await?;
+
+        let time_took = time_stats.1.elapsed().as_secs_f64();
+        req_stats.response_time = time_took;
+        req_stats.user_email = if user_email.is_empty() {
+            None
+        } else {
+            Some(user_email.to_string())
+        };
+
+        req_stats.dropped_records = match status {
+            IngestionStatus::Record(s) => s.failed.into(),
+            IngestionStatus::Bulk(s) => {
+                if s.errors {
+                    s.items
+                        .iter()
+                        .map(|i| {
+                            i.iter()
+                                .map(|(_, res)| if res.error.is_some() { 1 } else { 0 })
+                                .sum::<i64>()
+                        })
+                        .sum()
+                } else {
+                    0
+                }
+            }
+        };
+
+        if let Some(fns_length) = fn_num {
+            report_request_usage_stats(
+                req_stats,
+                &org_id,
+                &stream_name,
+                StreamType::Logs,
+                usage_type,
+                fns_length as u16,
+                time_stats.0,
+            )
+                .await;
+        }
+    }
+    Ok(())
+}
+
 async fn write_logs_by_stream(
     thread_id: usize,
     org_id: &str,
@@ -202,7 +269,7 @@ async fn write_logs_by_stream(
     time_stats: (i64, &Instant), // started_at
     usage_type: UsageType,
     status: &mut IngestionStatus,
-    json_data_by_stream: HashMap<String, O2IngestJsonData>,
+    json_data_by_stream: HashMap<String, (Vec<(i64, Map<String, Value>)>, Option<usize>)>,
 ) -> Result<()> {
     for (stream_name, (json_data, fn_num)) in json_data_by_stream {
         // check if we are allowed to ingest
